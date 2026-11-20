@@ -1,0 +1,156 @@
+from android_utils import R
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_private_field
+from java.lang import Boolean
+from ui.bulletin import BulletinHelper
+
+__id__ = "default_chat_folder"
+__name__ = "Основная папка"
+__description__ = "Выбирайте папку для запуска долгим нажатием на её вкладку."
+__author__ = "Codex"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+
+
+def account_key(fragment):
+    uid = int(fragment.getUserConfig().getClientUserId())
+    return "folder_" + str(uid) if uid else None
+
+
+def root_tabs(fragment):
+    if not fragment.isMainDialogList() or fragment.isArchive():
+        return None
+    if get_private_field(fragment, "onlySelect") or get_private_field(fragment, "inPreviewMode"):
+        return None
+    if int(get_private_field(fragment, "initialDialogsType")) != 0:
+        return None
+    return get_private_field(fragment, "filterTabsView")
+
+
+def filter_id(filters, tab_id, default_id):
+    if tab_id == default_id:
+        return 0
+    if 0 <= tab_id < filters.size():
+        return int(filters.get(tab_id).id)
+    return None
+
+
+class FolderMenu(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        menu = param.thisObject
+        anchor = get_private_field(menu, "scrimView")
+        if anchor is None or not self.plugin.tab_view.isInstance(anchor):
+            return
+        try:
+            fragment = get_private_field(menu, "fragment")
+            if fragment is None or not self.plugin.dialogs.isInstance(fragment):
+                return
+            tabs = root_tabs(fragment)
+            parent = anchor.getParent()
+            while parent is not None and parent != tabs:
+                parent = parent.getParent()
+            if tabs is None or parent is None:
+                return
+            tab_id = int(anchor.getId())
+            if tabs.isLocked(tab_id):
+                return
+            key = account_key(fragment)
+            fid = filter_id(fragment.getMessagesController().getDialogFilters(),
+                            tab_id, int(tabs.getDefaultTabId()))
+            if key is None or fid is None:
+                return
+            chosen = str(self.plugin.get_setting(key, "")) == str(fid)
+
+            def save():
+                self.plugin.set_setting(key, "" if chosen else str(fid))
+                self.plugin.finished.add(key)
+                BulletinHelper.show_info("Выбор основной папки сброшен" if chosen
+                                         else "Эта папка откроется при следующем запуске")
+
+            ctx = anchor.getContext()
+            icon = ctx.getResources().getIdentifier("msg_pin", "drawable", ctx.getPackageName())
+            menu.add(icon, "Сбросить основную папку" if chosen else "Открывать по умолчанию", R(save))
+        except Exception as error:
+            self.plugin.report(error)
+
+
+class Startup(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.schedule(param.thisObject)
+        except Exception as error:
+            self.plugin.report(error)
+
+
+class DefaultFolderPlugin(BasePlugin):
+    def report(self, error):
+        if not self.reported:
+            self.reported = True
+            self.log("Основная папка: " + str(error))
+
+    def on_plugin_load(self):
+        self.active = True
+        self.finished = set()
+        self.pending = set()
+        self.reported = False
+        self.dialogs = find_class("org.telegram.ui.DialogsActivity")
+        self.tab_view = find_class("org.telegram.ui.Components.FilterTabsView$TabView")
+        options = find_class("org.telegram.ui.Components.ItemOptions")
+        show = options.getDeclaredMethod("show")
+        update = self.dialogs.getDeclaredMethod("updateFilterTabs", Boolean.TYPE, Boolean.TYPE)
+        if self.tab_view is None:
+            raise RuntimeError("Эта версия AyuGram использует другой интерфейс папок.")
+        self.hook_method(show, FolderMenu(self))
+        self.hook_method(update, Startup(self))
+
+    def on_plugin_unload(self):
+        self.active = False
+
+    def schedule(self, fragment):
+        key = account_key(fragment)
+        if not key or key in self.finished or key in self.pending:
+            return
+        saved = str(self.get_setting(key, ""))
+        if not saved:
+            return
+        tabs = root_tabs(fragment)
+        if tabs is None or tabs.getTabsCount() < 2 or tabs.getVisibility() != 0:
+            return
+        self.pending.add(key)
+        original = tabs.getCurrentTabId()
+
+        def apply():
+            self.pending.discard(key)
+            try:
+                if not self.active or key in self.finished or key != account_key(fragment):
+                    return
+                if root_tabs(fragment) != tabs or not tabs.isAttachedToWindow():
+                    return
+                if tabs.getCurrentTabId() != original:
+                    self.finished.add(key)
+                    return
+                filters = fragment.getMessagesController().getDialogFilters()
+                for position in range(tabs.getTabsCount()):
+                    tab = tabs.getTab(position)
+                    if tab is None:
+                        continue
+                    tid = int(tab.id)
+                    fid = filter_id(filters, tid, int(tabs.getDefaultTabId()))
+                    if str(fid) == saved:
+                        self.finished.add(key)
+                        if tid != original and not tabs.isLocked(tid):
+                            tabs.scrollToTab(tab, position)
+                        return
+                if fragment.getMessagesController().dialogFiltersLoaded:
+                    self.finished.add(key)
+            except Exception as error:
+                self.report(error)
+
+        if not tabs.post(R(apply)):
+            self.pending.discard(key)

@@ -1,0 +1,1 @@
+{"schema": 1, "name": "Основная папка", "plugins": [{"id": "default_chat_folder", "name": "Основная папка", "description": "Выбирайте папку для запуска долгим нажатием на её вкладку.", "author": "Codex", "version": "1.0.0", "icon": "exteraPlugins/1", "file": "default_folder.plugin", "sha256": "1cd71b6eaa65e09c01adc189be255bb4b1de0484161b48f2f456734993662f58", "size": 6144}]}
