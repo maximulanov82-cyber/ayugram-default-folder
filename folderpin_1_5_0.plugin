@@ -1,0 +1,541 @@
+from android_utils import R, run_on_ui_thread
+from base_plugin import AppEvent, BasePlugin, MethodHook
+from client_utils import get_last_fragment, get_messages_controller, get_user_config
+from hook_utils import find_class, get_private_field
+from java import jclass
+from ui.settings import Header, Text
+
+SCROLL_MAX = 1000
+
+__id__ = "default_chat_folder"
+__name__ = "FolderPin"
+__description__ = "Выбирает стартовую папку при инициализации списка чатов."
+__author__ = "Codex"
+__version__ = "1.5.0"
+__icon__ = "windows10/3"
+
+
+def settings_key(user_id):
+    return f"startup_folder_id_{user_id}"
+
+
+def find_tab(tabs, filters, wanted):
+    for position in range(tabs.getTabsCount()):
+        tab = tabs.getTab(position)
+        if tab is None:
+            continue
+        index = int(tab.id)
+        if 0 <= index < filters.size() and int(filters.get(index).id) == wanted:
+            return tab
+    return None
+
+
+def scroll_anchor(widths, viewport, progress):
+    """Map 0..1000 to an adapter position and a pixel offset within its item."""
+    remaining = round(max(0, sum(widths) - viewport) * progress / SCROLL_MAX)
+    for index, width in enumerate(widths):
+        if remaining < width or index == len(widths) - 1:
+            return index, -remaining
+        remaining -= width
+    return 0, 0
+
+
+def strip_geometry(tabs):
+    # The native tab view caches actual item widths and horizontal positions.
+    view = tabs.getListView()
+    viewport = int(view.getWidth() - view.getPaddingLeft() - view.getPaddingRight())
+    count = int(tabs.getTabsCount())
+    if viewport <= 0 or count < 2:
+        return None
+    starts = get_private_field(tabs, "positionToX")
+    widths = get_private_field(tabs, "positionToWidth")
+    if starts is None or widths is None or starts.size() != count or widths.size() != count:
+        return None
+    spacing = int(starts.get(1) - starts.get(0) - widths.get(0))
+    last = count - 1
+    item_widths = [int(starts.get(i + 1) - starts.get(i)) for i in range(last)]
+    item_widths.append(int(widths.get(last)) + spacing)
+    if any(width <= 0 for width in item_widths):
+        return None
+    rows = []
+    for index, width in enumerate(item_widths):
+        tab = tabs.getTab(index)
+        glyph = str(getattr(tab, "emoticon", "") or "").strip()
+        title = str(getattr(tab, "title", "") or "").strip()
+        title = title or glyph or str(getattr(tab, "realTitle", "") or "")
+        rows.append((int(tab.id), title, int(getattr(tab, "counter", 0)), width))
+    return view, viewport, rows
+
+
+class ApplyAtStartup(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.try_apply(param.thisObject)
+
+
+class DefaultFolderPlugin(BasePlugin):
+    active = False
+    status = "Плагин выключен."
+
+    def create_settings(self):
+        try:
+            user_id = int(get_user_config().getClientUserId())
+            filters = get_messages_controller().getDialogFilters()
+            key = settings_key(user_id)
+            selected = int(self.get_setting(key, 0))
+            folders = [(-1, "Как настроено в клиенте")]
+            for index in range(filters.size()):
+                folder = filters.get(index)
+                fid = int(folder.id)
+                folders.append((fid, "Все" if fid == 0 else str(folder.name)))
+
+            def row(fid, label):
+                def select(*_):
+                    if int(get_user_config().getClientUserId()) == user_id:
+                        self.set_setting(key, fid, reload_settings=True)
+                return Text(text=label, icon="msg_check" if fid == selected else "msg_folder",
+                            accent=fid == selected, on_click=select)
+
+            scroll = self.scroll_value(user_id)
+            caption = "Как в клиенте" if scroll < 0 else self.format_percent(scroll)
+            return [
+                Header(text="Папка при запуске"),
+                *[row(fid, label) for fid, label in folders],
+                Header(text="Полоса папок"),
+                Text(text="Положение при открытии", subtext=caption,
+                     on_click=lambda *_: run_on_ui_thread(lambda: self.show_scroll_editor(user_id))),
+            ]
+        except Exception as error:
+            self.report("Список папок", error)
+            return [Text(text="Список папок недоступен", subtext=self.status)]
+
+    def report(self, step, error):
+        details = str(error).splitlines()[0][:180] if str(error) else type(error).__name__
+        self.status = f"{step}: {details}"
+        self.log(f"Основная папка: {self.status}")
+
+    def on_plugin_load(self):
+        self.active = True
+        self.finished = set()
+        self.hooks = []
+        self.strip_snapshots = {}
+        self.dialogs = None
+        self.probing = False
+        self.backgrounded = False
+        self.probe_token = object()
+        self.probe_screen = "экран ещё не открыт"
+        self.status = "Ожидание главного списка чатов."
+        try:
+            cls = find_class("org.telegram.ui.DialogsActivity")
+            if isinstance(cls, type):
+                cls = cls.getClass()
+            if cls is None:
+                raise RuntimeError("DialogsActivity не найден")
+            self.dialogs = cls
+            targets = {"updateFilterTabs": 2, "onBecomeFullyVisible": 0, "onResume": 0}
+            for method in cls.getDeclaredMethods():
+                name = str(method.getName())
+                if name in targets and len(method.getParameterTypes()) == targets[name]:
+                    try:
+                        method.setAccessible(True)
+                        handle = self.hook_method(method, ApplyAtStartup(self))
+                        if handle is not None:
+                            self.hooks.append(handle)
+                    except Exception as error:
+                        self.report(name, error)
+            if not self.hooks:
+                self.status = "Хуки запуска недоступны в этой сборке."
+        except Exception as error:
+            self.report("Подключение к списку чатов", error)
+        run_on_ui_thread(self.start_probe)
+
+    def on_plugin_unload(self):
+        self.active = False
+        for handle in self.hooks:
+            self.unhook_method(handle)
+        self.hooks.clear()
+
+    def on_app_event(self, event):
+        if event == AppEvent.PAUSE:
+            run_on_ui_thread(self.left_foreground)
+        elif event in (AppEvent.START, AppEvent.RESUME):
+            run_on_ui_thread(self.entered_foreground)
+
+    def left_foreground(self):
+        if not self.active:
+            return
+        self.backgrounded = True
+        self.probing = False
+        self.probe_token = object()
+
+    def entered_foreground(self):
+        if not self.active:
+            return
+        if self.backgrounded:
+            self.backgrounded = False
+            self.finished.clear()
+        self.start_probe()
+
+    def find_open_chats(self):
+        # SDK versions return either the visible child or the MainTabs container.
+        top = get_last_fragment()
+        if top is None:
+            launch = jclass("org.telegram.ui.LaunchActivity")
+            top = launch.getLastFragment()
+        if top is None:
+            return None
+
+        name = str(top.getClass().getName())
+        self.probe_screen = name.rsplit(".", 1)[-1]
+        for getter in ("getCurrentVisibleFragment", "getDialogsActivity"):
+            method = getattr(top, getter, None)
+            if method is not None:
+                child = method()
+                if self.is_chat_screen(child):
+                    return child
+        return top if self.is_chat_screen(top) else None
+
+    def is_chat_screen(self, fragment):
+        if fragment is None:
+            return False
+        if self.dialogs is not None and self.dialogs.isInstance(fragment):
+            return True
+        return str(fragment.getClass().getName()) == "org.telegram.ui.DialogsActivity"
+
+    def start_probe(self):
+        if not self.active or self.backgrounded or self.probing:
+            return
+        self.probing = True
+        self.probe(0, self.probe_token)
+
+    def probe(self, attempt, token):
+        if not self.active or token is not self.probe_token:
+            return
+        try:
+            uid = int(get_user_config().getClientUserId())
+            if not uid or uid in self.finished:
+                self.probing = False
+                return
+            fragment = self.find_open_chats()
+            if fragment is not None:
+                self.try_apply(fragment)
+            if uid in self.finished:
+                self.probing = False
+                return
+            delays = (150, 300, 600, 1000, 1500, 2400)
+            if attempt < len(delays):
+                run_on_ui_thread(lambda: self.probe(attempt + 1, token), delays[attempt])
+                return
+            if fragment is None:
+                self.status = f"Экран чатов не найден. Открыт: {self.probe_screen}."
+            self.probing = False
+        except Exception as error:
+            self.probing = False
+            self.report("Поиск экрана чатов", error)
+
+    def try_apply(self, fragment):
+        if not self.active or self.backgrounded:
+            return
+        try:
+            if fragment.isArchive() or not fragment.isMainDialogList():
+                self.status = "Открытый список чатов не является главным."
+                return
+            if get_private_field(fragment, "onlySelect") or get_private_field(fragment, "inPreviewMode"):
+                return
+            uid = int(fragment.getUserConfig().getClientUserId())
+            if not uid or uid != int(get_user_config().getClientUserId()) or uid in self.finished:
+                return
+            tabs = get_private_field(fragment, "filterTabsView")
+            if tabs is None or tabs.getTabsCount() < 2 or tabs.getVisibility() != 0:
+                self.status = "Вкладки ещё не готовы."
+                return
+            selected = int(self.get_setting(settings_key(uid), 0))
+            if selected < 0:
+                self.finished.add(uid)
+                self.status = "Оставлена настройка клиента."
+                self.queue_strip(uid, tabs, int(tabs.getCurrentTabId()))
+                return
+            target = find_tab(tabs, fragment.getMessagesController().getDialogFilters(), selected)
+            if target is None:
+                self.status = "Выбранная папка скрыта или отсутствует."
+                return
+            destination = int(target.id)
+            if tabs.isLocked(destination):
+                self.finished.add(uid)
+                self.status = "Выбранная папка заблокирована."
+                return
+            action_bar = fragment.getActionBar()
+            if action_bar is not None and (action_bar.isSearchFieldVisible() or action_bar.isActionModeShowed()):
+                self.finished.add(uid)
+                self.status = "В момент запуска был открыт поиск или режим выделения."
+                return
+
+            if get_private_field(fragment, "startedTracking") or get_private_field(fragment, "tabsAnimationInProgress"):
+                self.finished.add(uid)
+                self.status = "Вкладка переключается пользователем."
+                return
+            self.finished.add(uid)
+            pages = get_private_field(fragment, "viewPages")
+            if pages is None or not len(pages):
+                raise RuntimeError("Нет активной страницы чатов")
+            page = pages[0]
+            old_index = int(get_private_field(page, "selectedType"))
+            old_tab = int(tabs.getCurrentTabId())
+            if old_index != destination or old_tab != destination:
+                self.select(fragment, tabs, page, destination, old_index, old_tab)
+            self.status = "Выбранная папка открыта."
+            self.queue_strip(uid, tabs, destination)
+        except Exception as error:
+            self.report("Выбор стартовой папки", error)
+
+    @staticmethod
+    def scroll_key(user_id):
+        return f"startup_strip_scroll_{user_id}"
+
+    def scroll_value(self, user_id):
+        try:
+            return min(SCROLL_MAX, max(-1, int(self.get_setting(self.scroll_key(user_id), -1))))
+        except (TypeError, ValueError):
+            return -1
+
+    @staticmethod
+    def format_percent(value):
+        percent = f"{value / 10:.1f}".removesuffix(".0").replace(".", ",")
+        return f"{percent}%"
+
+    def queue_strip(self, user_id, tabs, active_tab):
+        token = self.probe_token
+
+        def apply(attempt=0):
+            if not self.active or self.backgrounded or token is not self.probe_token:
+                return
+            try:
+                if int(get_user_config().getClientUserId()) != user_id or int(tabs.getCurrentTabId()) != active_tab:
+                    return
+                geometry = strip_geometry(tabs)
+                if geometry is None or not tabs.isShown():
+                    if attempt < 3:
+                        run_on_ui_thread(lambda: apply(attempt + 1), 70)
+                    return
+                view, viewport, rows = geometry
+                self.strip_snapshots[user_id] = (viewport, rows, active_tab, int(view.getLayoutDirection()))
+                value = self.scroll_value(user_id)
+                if value < 0:
+                    return
+                if int(view.getScrollState()) != 0 or tabs.isAnimatingIndicator():
+                    return
+                if view.isComputingLayout() or view.isLayoutRequested():
+                    if attempt < 3:
+                        run_on_ui_thread(lambda: apply(attempt + 1), 70)
+                    return
+                widths = [row[3] for row in rows]
+                if sum(widths) > viewport:
+                    position, offset = scroll_anchor(widths, viewport, value)
+                    view.getLayoutManager().scrollToPositionWithOffset(position, offset)
+            except Exception as error:
+                self.log(f"FolderPin, положение полосы: {error}")
+
+        run_on_ui_thread(apply, 48)
+
+    def scroll_snapshot(self, activity, user_id):
+        cached = getattr(self, "strip_snapshots", {}).get(user_id)
+        try:
+            stack = activity.getActionBarLayout().getFragmentStack()
+            root = stack.get(0) if not stack.isEmpty() else None
+            getter = getattr(root, "getDialogsActivity", None)
+            chats = getter() if getter is not None else root
+            if self.is_chat_screen(chats):
+                tabs = get_private_field(chats, "filterTabsView")
+                geometry = strip_geometry(tabs) if tabs is not None else None
+                if geometry is not None:
+                    view, viewport, rows = geometry
+                    return viewport, rows, int(tabs.getCurrentTabId()), int(view.getLayoutDirection())
+        except Exception:
+            pass  # Some clients pause the chat view while the settings screen is open.
+        return cached
+
+    def show_scroll_editor(self, user_id):
+        from android.content.res import ColorStateList
+        from android.graphics.drawable import GradientDrawable
+        from android.text import TextUtils
+        from android.view import Gravity
+        from android.widget import HorizontalScrollView, LinearLayout, SeekBar, TextView
+        from java import dynamic_proxy
+        from org.telegram.ui.ActionBar import Theme
+        from ui.alert import AlertDialogBuilder
+
+        top = get_last_fragment()
+        activity = top.getParentActivity() if top is not None else None
+        if activity is None or int(get_user_config().getClientUserId()) != user_id:
+            return
+
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("Положение полосы папок")
+        snapshot = self.scroll_snapshot(activity, user_id)
+        if snapshot is None:
+            dialog.set_message("Открой список чатов, затем вернись сюда. Для предпросмотра нужны размеры полосы папок.")
+            dialog.set_positive_button("Закрыть")
+            dialog.show()
+            return
+        viewport, rows, active_tab, direction = snapshot
+        density = float(activity.getResources().getDisplayMetrics().density)
+
+        def dp(size):
+            return round(size * density)
+
+        def rounded(color, radius):
+            bg = GradientDrawable()
+            bg.setCornerRadius(dp(radius))
+            bg.setColor(color)
+            return bg
+
+        accent = Theme.getColor(Theme.key_windowBackgroundWhiteBlueText)
+        normal = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+        secondary = Theme.getColor(Theme.key_windowBackgroundWhiteGrayText2)
+        background = Theme.getColor(Theme.key_windowBackgroundGray)
+
+        content = LinearLayout(activity)
+        content.setOrientation(LinearLayout.VERTICAL)
+        content.setPadding(dp(20), dp(8), dp(20), dp(10))
+
+        preview = HorizontalScrollView(activity)
+        preview.setHorizontalScrollBarEnabled(False)
+        preview.setOverScrollMode(2)
+        preview.setClipToOutline(True)
+        preview.setBackground(rounded(background, 18))
+        preview.setLayoutDirection(direction)
+        strip = LinearLayout(activity)
+        strip.setOrientation(LinearLayout.HORIZONTAL)
+        strip.setLayoutDirection(direction)
+        preview.addView(strip)
+        content.addView(preview, LinearLayout.LayoutParams(-1, dp(48)))
+
+        pills = []
+        for tid, title, counter, width in rows:
+            chip = TextView(activity)
+            chip.setGravity(Gravity.CENTER)
+            chip.setSingleLine(True)
+            chip.setEllipsize(TextUtils.TruncateAt.END)
+            chip.setTextSize(13)
+            chip.setTextColor(accent if tid == active_tab else normal)
+            chip.setText(f"{title}  {counter}" if counter > 0 else title)
+            if tid == active_tab:
+                # Same theme accent at low opacity, so the current tab is legible.
+                tint = (accent & 0x00FFFFFF) | 0x29000000
+                chip.setBackground(rounded(tint, 17))
+            strip.addView(chip, LinearLayout.LayoutParams(width, -1))
+            pills.append((chip, width))
+
+        summary = TextView(activity)
+        summary.setTextSize(13)
+        summary.setTextColor(secondary)
+        summary.setPadding(0, dp(12), 0, 0)
+        content.addView(summary, LinearLayout.LayoutParams(-1, -2))
+
+        slider = SeekBar(activity)
+        slider.setMax(SCROLL_MAX)
+        slider.setLayoutDirection(direction)
+        slider.setContentDescription("Положение полосы папок")
+        slider.setProgressTintList(ColorStateList.valueOf(accent))
+        slider.setThumbTintList(ColorStateList.valueOf(accent))
+        value = self.scroll_value(user_id)
+        slider.setProgress(max(0, value))
+        content.addView(slider, LinearLayout.LayoutParams(-1, dp(48)))
+
+        labels = LinearLayout(activity)
+        labels.setLayoutDirection(direction)
+        for label, gravity in (("Начало", Gravity.START), ("Конец", Gravity.END)):
+            text = TextView(activity)
+            text.setText(label)
+            text.setTextSize(12)
+            text.setTextColor(secondary)
+            text.setGravity(gravity)
+            labels.addView(text, LinearLayout.LayoutParams(0, -2, 1.0))
+        content.addView(labels, LinearLayout.LayoutParams(-1, -2))
+
+        def move_preview(progress):
+            if not scrollable:
+                return
+            overflow = max(0, int(strip.getWidth() - preview.getWidth()))
+            shift = round(overflow * progress / SCROLL_MAX)
+            preview.scrollTo(overflow - shift if direction == 1 else shift, 0)
+            summary.setText(f"Предпросмотр · {self.format_percent(progress)}")
+
+        def fit_preview(available):
+            if available <= 0:
+                return
+            ratio = available / viewport
+            for chip, width in pills:
+                params = chip.getLayoutParams()
+                params.width = max(1, round(width * ratio))
+                chip.setLayoutParams(params)
+            strip.post(R(lambda: move_preview(int(slider.getProgress()))))
+
+        class SliderListener(dynamic_proxy(jclass("android.widget.SeekBar$OnSeekBarChangeListener"))):
+            def onProgressChanged(self, bar, progress, from_user):
+                move_preview(int(progress))
+
+            def onStartTrackingTouch(self, bar):
+                pass
+
+            def onStopTrackingTouch(self, bar):
+                pass
+
+        class SizeListener(dynamic_proxy(jclass("android.view.View$OnLayoutChangeListener"))):
+            def onLayoutChange(self, view, left, top, right, bottom, old_left, old_top, old_right, old_bottom):
+                if right - left != old_right - old_left:
+                    fit_preview(right - left)
+
+        preview.addOnLayoutChangeListener(SizeListener())
+        scrollable = sum(row[3] for row in rows) > viewport
+        slider.setOnSeekBarChangeListener(SliderListener())
+        if not scrollable:
+            slider.setEnabled(False)
+            summary.setText("Все папки помещаются на экране.")
+        else:
+            move_preview(int(slider.getProgress()))
+
+        def save(builder, _):
+            if scrollable and int(get_user_config().getClientUserId()) == user_id:
+                self.set_setting(self.scroll_key(user_id), int(slider.getProgress()), reload_settings=True)
+            builder.dismiss()
+
+        def reset(builder, _):
+            if int(get_user_config().getClientUserId()) == user_id:
+                self.set_setting(self.scroll_key(user_id), -1, reload_settings=True)
+            builder.dismiss()
+
+        dialog.set_view(content)
+        dialog.set_positive_button("Сохранить", save)
+        dialog.set_negative_button("Как в клиенте", reset)
+        dialog.show()
+
+    def select(self, fragment, tabs, page, destination, old_index, old_tab):
+        # Bind the list to the target page and synchronize the native tab indicator.
+        # The startup path must work without waiting for swipe animation or view width.
+        old_stable = int(tabs.getStableId(old_tab))
+        stable = int(tabs.getStableId(destination))
+        if stable < 0:
+            raise RuntimeError("Вкладка без устойчивого ID")
+        rebuild = fragment.switchToCurrentSelectedMode
+        refresh = tabs.finishAddingTabs
+        selected_type = page.getClass().getDeclaredField("selectedType")
+        selected_type.setAccessible(True)
+        selected_type.setInt(page, destination)
+        try:
+            if not tabs.selectTabWithStableId(stable):
+                raise RuntimeError("Клиент не принял выбранную вкладку")
+            rebuild(False)
+            refresh(False)
+            if int(tabs.getCurrentTabId()) != destination or int(get_private_field(page, "selectedType")) != destination:
+                raise RuntimeError("Клиент изменил выбранную вкладку")
+        except Exception:
+            selected_type.setInt(page, old_index)
+            if old_stable >= 0:
+                tabs.selectTabWithStableId(old_stable)
+            rebuild(False)
+            refresh(False)
+            raise
