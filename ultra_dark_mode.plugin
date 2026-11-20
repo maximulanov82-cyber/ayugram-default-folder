@@ -1,0 +1,613 @@
+from threading import RLock
+
+from android_utils import run_on_ui_thread
+from base_plugin import AppEvent, BasePlugin, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class
+from java import dynamic_proxy, jclass
+from ui.settings import Custom, Header, Selector, Switch, Text
+
+__id__ = "ultra_dark_mode"
+__name__ = "Ultra Dark Mode"
+__description__ = "Четыре палитры для тёмной темы и отдельное оформление сообщений."
+__author__ = "Codex"
+__version__ = "1.0.0"
+__app_version__ = ">=12.5.1"
+
+PRESETS = (
+    ("AMOLED Black", 0x000000),
+    ("Ultra Dark", 0x0B0B0D),
+    ("Graphite", 0x141416),
+    ("Soft Dark", 0x202127),
+)
+INCOMING = ("Как в теме", "Графитовый", "Нейтральный", "Чёрный")
+OUTGOING = ("Как в теме", "Тёмно-синий", "Сине-серый", "Графитовый")
+IN_COLORS = (None, 0x202125, 0x2B2B30, 0x101012)
+OUT_COLORS = (None, 0x14253B, 0x223349, 0x282A32)
+DEFAULTS = dict(enabled=False, preset=1, intensity=100, black=False, panels=True,
+                incoming=1, outgoing=1, pinned=True, menus=True)
+
+MAIN = ("windowBackgroundWhite", "actionBarDefault", "actionBarDefaultArchived")
+PANELS = ("windowBackgroundGray", "chat_messagePanelBackground", "chats_menuBackground")
+PINNED = "chat_topPanelBackground"
+MENUS = "actionBarDefaultSubmenuBackground"
+GRADIENTS = tuple(f"chat_outBubbleGradient{i}" for i in range(1, 4))
+BUBBLES = {
+    "incoming": (
+        "chat_inBubble", "chat_inBubbleSelected",
+        ("chat_messageTextIn", "chat_messageLinkIn", "chat_inTimeText", "chat_inTimeSelectedText"),
+        ("chat_messageTextIn", "chat_messageLinkIn"),
+    ),
+    "outgoing": (
+        "chat_outBubble", "chat_outBubbleSelected",
+        ("chat_messageTextOut", "chat_messageLinkOut", "chat_outTimeText",
+         "chat_outTimeSelectedText", "chat_outSentCheck", "chat_outSentCheckSelected",
+         "chat_outSentCheckRead", "chat_outSentCheckReadSelected",
+         "chat_outSentClock", "chat_outSentClockSelected"),
+        ("chat_messageTextOut", "chat_messageLinkOut"),
+    ),
+}
+PREVIEW_KEYS = ("actionBarDefaultTitle", "chat_messagePanelHint", "windowBackgroundWhiteBlueText")
+NAMES = set(MAIN + PANELS + (PINNED, MENUS) + GRADIENTS + PREVIEW_KEYS)
+for bubble, selected, labels, _ in BUBBLES.values():
+    NAMES.update((bubble, selected, *labels))
+
+
+def int_color(color):
+    value = color & 0xFFFFFFFF
+    return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def mix(start, end, fraction):
+    value = 0
+    for shift in (0, 8, 16, 24):
+        lo, hi = (start >> shift) & 255, (end >> shift) & 255
+        value |= round(lo + (hi - lo) * fraction) << shift
+    return int_color(value)
+
+
+def luminance(color):
+    total = 0.0
+    for shift, weight in ((16, .2126), (8, .7152), (0, .0722)):
+        channel = ((color >> shift) & 255) / 255
+        total += weight * (channel / 12.92 if channel <= .04045 else ((channel + .055) / 1.055) ** 2.4)
+    return total
+
+
+def contrast(foreground, background):
+    alpha = ((foreground >> 24) & 255) / 255
+    shown = mix(background, foreground, alpha)
+    lo, hi = sorted((luminance(shown), luminance(background)))
+    return (hi + .05) / (lo + .05)
+
+
+def readable(color, surfaces, minimum):
+    def ratio(candidate):
+        return min(contrast(candidate, surface) for surface in surfaces)
+
+    if ratio(color) >= minimum:
+        return color
+    white = -1
+    black = int_color(0xFF000000)
+    target = max((white, black), key=ratio)
+    if ratio(target) < minimum:
+        return target
+    low, high = 0.0, 1.0
+    for _ in range(9):
+        mid = (low + high) / 2
+        if ratio(mix(color, target, mid)) < minimum:
+            low = mid
+        else:
+            high = mid
+    return mix(color, target, high)
+
+
+def replacements(base, config):
+    """Build an overlay from the untouched, resolved native palette."""
+    power = config["intensity"] / 100
+    if not power:
+        return {}
+    result = {}
+    preset = int_color(PRESETS[config["preset"]][1] | 0xFF000000)
+    black = int_color(0xFF000000)
+    lifted = mix(preset, -1, .045)
+
+    def paint(name, color, darken_only=False):
+        if name in base:
+            if darken_only and luminance(color) >= luminance(base[name]):
+                return
+            value = mix(base[name], color, power)
+            if value != base[name]:
+                result[name] = value
+
+    for name in MAIN:
+        paint(name, black if config["black"] else preset)
+    if config["panels"]:
+        for name in PANELS:
+            paint(name, lifted, darken_only=True)
+    if config["pinned"]:
+        paint(PINNED, lifted, darken_only=True)
+    if config["menus"]:
+        paint(MENUS, mix(preset, -1, .075), darken_only=True)
+
+    for group, (bubble, selected, labels, text_labels) in BUBBLES.items():
+        palette = IN_COLORS if group == "incoming" else OUT_COLORS
+        rgb = palette[config[group]]
+        if rgb is None or bubble not in base:
+            continue
+        target = int_color(0xFF000000 | rgb)
+        paint(bubble, target)
+        paint(selected, mix(target, -1, .10))
+        surfaces = [result.get(bubble, base[bubble])]
+        if selected in base:
+            surfaces.append(result.get(selected, base[selected]))
+        if group == "outgoing":
+            for name in GRADIENTS:
+                if base.get(name):
+                    paint(name, target)
+                    surfaces.append(result.get(name, base[name]))
+        for label in labels:
+            if label in base:
+                legible = readable(base[label], surfaces, 4.5 if label in text_labels else 3.0)
+                if legible != base[label]:
+                    result[label] = legible
+
+    return result
+
+
+def bounded(value, upper, default):
+    try:
+        return min(upper, max(0, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+class BeforeCommonTheme(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        self.plugin.overlay_current_palette()
+
+
+class UltraDarkPlugin(BasePlugin):
+    live = False
+    problem = ""
+
+    def read_config(self):
+        config = {}
+        for name, default in DEFAULTS.items():
+            value = self.get_setting(name, default)
+            if isinstance(default, bool):
+                config[name] = value is True or str(value).lower() == "true"
+            else:
+                maximum = 100 if name == "intensity" else 3
+                config[name] = bounded(value, maximum, default)
+        return config
+
+    def on_plugin_load(self):
+        self.lock = RLock()
+        self.hook = None
+        self.overlay = None
+        self.original = None
+        self.base = None
+        self.failure_logged = False
+        self.preview_factory = None
+        self.preview_refs = []
+        self.problem = ""
+        self.pending = 0
+        self.config = self.read_config()
+        try:
+            self.theme = jclass("org.telegram.ui.ActionBar.Theme")
+            clazz = find_class("org.telegram.ui.ActionBar.Theme")
+            if isinstance(clazz, type):
+                clazz = clazz.getClass()
+            if clazz is None:
+                raise RuntimeError("Класс Theme недоступен.")
+            self.table = clazz.getDeclaredField("currentColors")
+            self.table.setAccessible(True)
+            self.temporary_theme = None
+            try:
+                flag = clazz.getDeclaredField("hasPreviousTheme")
+                flag.setAccessible(True)
+                self.temporary_theme = flag
+            except Exception:
+                pass
+            modifier = jclass("java.lang.reflect.Modifier")
+            flags = self.table.getModifiers()
+            if (str(self.table.getType().getName()) != "android.util.SparseIntArray"
+                    or not modifier.isStatic(flags) or modifier.isFinal(flags)):
+                raise RuntimeError("Таблица цветов темы имеет другой формат.")
+            methods = {(str(method.getName()), tuple(str(arg.getName()) for arg in method.getParameterTypes())): method
+                       for method in clazz.getDeclaredMethods()}
+            method = methods[("applyCommonTheme", ())]
+            for signature in (("refreshThemeColors", ("boolean", "boolean")),
+                              ("isCurrentThemeDark", ()),
+                              ("getColor", ("int", "[Z", "boolean"))):
+                self._require_theme_method(methods, signature)
+            self.keys = {}
+            for name in NAMES:
+                field = getattr(self.theme, "key_" + name, None)
+                if field is not None:
+                    self.keys[name] = int(field)
+            required = {*MAIN[:2], "chat_inBubble", "chat_outBubble", "chat_messageTextIn",
+                        "chat_messageTextOut", "chat_messagePanelBackground", "windowBackgroundWhiteBlueText"}
+            if not required.issubset(self.keys):
+                raise RuntimeError("В сборке отсутствуют необходимые ключи палитры.")
+            method.setAccessible(True)
+            self.hook = self.hook_method(method, BeforeCommonTheme(self))
+            if self.hook is None:
+                raise RuntimeError("Движок плагинов не подключил обработчик темы.")
+            self.live = True
+            if self.config["enabled"]:
+                self.request_refresh()
+        except Exception as error:
+            self.live = False
+            self.problem = "Эта сборка клиента использует несовместимый движок темы."
+            self.log(f"Ultra Dark Mode: {error}")
+
+    @staticmethod
+    def _require_theme_method(methods, signature):
+        modifier = jclass("java.lang.reflect.Modifier")
+        method = methods[signature]
+        if not modifier.isPublic(method.getModifiers()) or not modifier.isStatic(method.getModifiers()):
+            raise RuntimeError(f"Недоступный метод Theme.{signature[0]}")
+
+    def native_colors(self):
+        return {name: int(self.theme.getColor(key, None, True)) for name, key in self.keys.items()}
+
+    def can_overlay(self):
+        return (self.theme.isCurrentThemeDark() and
+                (self.temporary_theme is None or not self.temporary_theme.getBoolean(None)))
+
+    def overlay_current_palette(self):
+        # The native refresh has just published an unmodified palette. Build our
+        # copy before Telegram's common, dialog and chat caches consume it.
+        try:
+            with self.lock:
+                config = self.config
+                if not self.live or not config["enabled"] or not self.can_overlay():
+                    return
+                current = self.table.get(None)
+                if current is None or current == self.overlay:
+                    return
+                base = self.native_colors()
+                colors = replacements(base, config)
+                if not colors:
+                    return
+                enhanced = current.clone()
+                for name, value in colors.items():
+                    enhanced.put(self.keys[name], value)
+                if self.table.get(None) == current:
+                    self.table.set(None, enhanced)
+                    self.original = current
+                    self.overlay = enhanced
+                    self.base = base
+        except Exception as error:
+            self.problem = "Не удалось применить палитру к теме этой сборки."
+            if not self.failure_logged:
+                self.failure_logged = True
+                self.log(f"Ultra Dark Mode, палитра: {error}")
+
+    def request_refresh(self):
+        self.pending += 1
+        sequence = self.pending
+
+        def refresh():
+            if self.live and self.pending == sequence:
+                self.refresh_theme()
+                self.update_previews()
+
+        run_on_ui_thread(refresh)
+
+    def refresh_theme(self):
+        try:
+            with self.lock:
+                old_overlay = self.overlay
+                if old_overlay is not None and self.table.get(None) == old_overlay:
+                    self.table.set(None, self.original)
+                self.original = self.overlay = self.base = None
+                # messages=True skips wallpaper reload. The user's theme and its
+                # accent preferences stay intact, including during unload.
+                self.theme.refreshThemeColors(False, True)
+                if (self.live and self.config["enabled"] and self.can_overlay()
+                        and self.overlay is None and replacements(self.native_colors(), self.config)):
+                    raise RuntimeError("Нативное обновление не вызвало обработчик палитры.")
+            self.refresh_legacy_views()
+        except Exception as error:
+            self.problem = "Не удалось обновить тему клиента."
+            self.log(f"Ultra Dark Mode, обновление: {error}")
+
+    def refresh_legacy_views(self):
+        # Newer clients update view bindings on didSetNewTheme themselves.
+        # Older LaunchActivity implementations update only the drawer and bars.
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None or getattr(activity, "notifyThemeColorsChanged", None) is not None:
+                return
+            stack = activity.getActionBarLayout().getFragmentStack()
+            keys = set(self.keys.values())
+            for index in range(stack.size()):
+                screen = stack.get(index)
+                descriptions = screen.getThemeDescriptions()
+                if descriptions is None:
+                    continue
+                for pos in range(descriptions.size()):
+                    description = descriptions.get(pos)
+                    key = int(description.getCurrentKey())
+                    if key in keys:
+                        color = int(description.getSetColor())
+                        description.setColor(color, False, False)
+        except Exception as error:
+            self.log(f"Ultra Dark Mode, обновление открытого экрана: {error}")
+
+    def on_app_event(self, event):
+        if event in (AppEvent.START, AppEvent.RESUME) and self.live and self.config["enabled"]:
+            def ensure_current():
+                try:
+                    if (self.live and not self.problem and self.config["enabled"] and self.config["intensity"]
+                            and self.can_overlay() and self.table.get(None) != self.overlay):
+                        self.refresh_theme()
+                except Exception as error:
+                    self.log(f"Ultra Dark Mode, состояние темы: {error}")
+            run_on_ui_thread(ensure_current)
+
+    def on_plugin_unload(self):
+        if not hasattr(self, "lock"):
+            return
+        with self.lock:
+            self.live = False
+            was_applied = self.overlay is not None
+        try:
+            if self.hook is not None:
+                self.unhook_method(self.hook)
+        finally:
+            if was_applied:
+                run_on_ui_thread(self.refresh_theme)
+            if self.preview_factory is not None:
+                try:
+                    self.preview_factory.release()
+                except Exception as error:
+                    self.log(f"Ultra Dark Mode, предпросмотр: {error}")
+            self.preview_factory = None
+            self.preview_refs = []
+
+    def changed(self, key):
+        def on_change(value):
+            if not self.live:
+                return
+            config = self.read_config()
+            default = DEFAULTS[key]
+            maximum = 100 if key == "intensity" else 3
+            config[key] = (value is True or str(value).lower() == "true") if isinstance(default, bool) else bounded(value, maximum, default)
+            self.config = config
+            self.request_refresh()
+        return on_change
+
+    def switch(self, key, title, subtext=None):
+        return Switch(key=key, text=title, default=DEFAULTS[key], subtext=subtext,
+                      on_change=self.changed(key))
+
+    def selector(self, key, title, choices):
+        return Selector(key=key, text=title, default=DEFAULTS[key], items=list(choices),
+                        on_change=self.changed(key))
+
+    def create_settings(self):
+        if not self.live or self.problem:
+            return [Text(text=self.problem or "Включи плагин в списке плагинов.")]
+        return [
+            self.switch("enabled", "Включить режим", "Действует поверх активной тёмной темы."),
+            Header(text="Пресет темы"),
+            self.selector("preset", "Палитра", [name for name, _ in PRESETS]),
+            Header(text="Интенсивность"),
+            Text(text="Уровень затемнения", subtext=f"{self.read_config()['intensity']}%",
+                 on_click=lambda *_: run_on_ui_thread(self.show_editor)),
+            Header(text="Интерфейс"),
+            self.switch("black", "Чисто чёрный фон", "Фон списка и шапок при затемнении 100%."),
+            self.switch("panels", "Затемнять второстепенные панели"),
+            Header(text="Чаты"),
+            Text(text="Оформление чатов", create_sub_fragment=self.chat_settings),
+            Text(text="Открыть предпросмотр", on_click=lambda *_: run_on_ui_thread(self.show_editor)),
+        ]
+
+    def chat_settings(self):
+        rows = [Header(text="Цвета сообщений"),
+                self.selector("outgoing", "Исходящие сообщения", OUTGOING),
+                self.selector("incoming", "Входящие сообщения", INCOMING)]
+        if PINNED in self.keys or MENUS in self.keys:
+            rows.append(Header(text="Панели чата"))
+        if PINNED in self.keys:
+            rows.append(self.switch("pinned", "Панель закреплённого сообщения"))
+        if MENUS in self.keys:
+            rows.append(self.switch("menus", "Контекстные меню"))
+        rows.append(Header(text="Предпросмотр чата"))
+        try:
+            if self.preview_factory is None:
+                from ui.settings import SimpleSettingFactory
+                self.preview_factory = SimpleSettingFactory(self.create_preview_row, self.bind_preview_row)
+            rows.append(Custom(factory=self.preview_factory.instance.java))
+        except Exception:
+            rows.append(Text(text="Открыть предпросмотр", on_click=lambda *_: run_on_ui_thread(self.show_editor)))
+        return rows
+
+    def preview_palette(self, config):
+        with self.lock:
+            if self.base is not None and self.table.get(None) == self.overlay:
+                base = self.base
+            else:
+                base = self.native_colors()
+        if not self.theme.isCurrentThemeDark():
+            return None
+        return {**base, **replacements(base, config)}
+
+    @staticmethod
+    def dp(context, value):
+        return round(context.getResources().getDisplayMetrics().density * value)
+
+    @staticmethod
+    def surface(context, color, radius):
+        drawable = jclass("android.graphics.drawable.GradientDrawable")()
+        drawable.setCornerRadius(UltraDarkPlugin.dp(context, radius))
+        drawable.setColor(color)
+        return drawable
+
+    def preview_view(self, context):
+        Linear = jclass("android.widget.LinearLayout")
+        Params = jclass("android.widget.LinearLayout$LayoutParams")
+        Label = jclass("android.widget.TextView")
+        Gravity = jclass("android.view.Gravity")
+        card = Linear(context)
+        card.setOrientation(Linear.VERTICAL)
+        card.setPadding(self.dp(context, 10), self.dp(context, 6),
+                        self.dp(context, 10), self.dp(context, 6))
+        for index, title in enumerate(("Telegram", "Пример входящего сообщения",
+                                       "Пример исходящего сообщения", "Сообщение")):
+            text = Label(context)
+            text.setText(title)
+            text.setTextSize(15 if index == 0 else 14)
+            if index == 0:
+                face = jclass("android.graphics.Typeface")
+                text.setTypeface(face.create("sans-serif-medium", face.NORMAL))
+            params = Params(-1 if index in (0, 3) else -2, -2)
+            params.gravity = Gravity.END if index == 2 else Gravity.START
+            params.bottomMargin = self.dp(context, 6)
+            text.setPadding(self.dp(context, 12), self.dp(context, 9),
+                            self.dp(context, 12), self.dp(context, 9))
+            card.addView(text, params)
+        return card
+
+    def preview_icon(self, row, name, color, trailing=False):
+        context = row.getContext()
+        resources = context.getResources()
+        reference = resources.getIdentifier(name, "drawable", context.getPackageName())
+        if not reference:
+            return
+        drawable = resources.getDrawable(reference, context.getTheme()).mutate()
+        size = self.dp(context, 17)
+        drawable.setBounds(0, 0, size, size)
+        drawable.setTint(color)
+        row.setCompoundDrawablePadding(self.dp(context, 7))
+        if trailing:
+            row.setCompoundDrawablesRelative(None, None, drawable, None)
+        else:
+            row.setCompoundDrawablesRelative(drawable, None, None, None)
+
+    def render_preview(self, view, config):
+        context = view.getContext()
+        palette = self.preview_palette(config)
+        if palette is None:
+            view.setBackground(None)
+            title = view.getChildAt(0)
+            title.setText("Включи тёмную тему клиента для предпросмотра.")
+            title.setTextColor(self.theme.getColor(self.theme.key_windowBackgroundWhiteBlackText))
+            for index in (1, 2, 3):
+                view.getChildAt(index).setVisibility(8)
+            return
+        view.setBackground(self.surface(context, palette["windowBackgroundWhite"], 18))
+        view.getChildAt(0).setText("Telegram")
+        roles = (("actionBarDefault", "actionBarDefaultTitle"),
+                 ("chat_inBubble", "chat_messageTextIn"),
+                 ("chat_outBubble", "chat_messageTextOut"),
+                 ("chat_messagePanelBackground", "chat_messagePanelHint"))
+        for index, (bg, fg) in enumerate(roles):
+            row = view.getChildAt(index)
+            row.setVisibility(0)
+            background = palette[bg]
+            foreground = readable(palette.get(fg, -1), [background], 4.5)
+            row.setTextColor(foreground)
+            row.setBackground(self.surface(context, background, 15))
+            if index == 0:
+                self.preview_icon(row, "ic_ab_back", foreground)
+            elif index == 2:
+                color = readable(palette.get("chat_outSentCheckRead", foreground), [background], 3.0)
+                self.preview_icon(row, "msg_check", color, trailing=True)
+            elif index == 3:
+                self.preview_icon(row, "msg_attach", foreground)
+
+    def create_preview_row(self, context, list_view, account, guid, provider):
+        return self.preview_view(context)
+
+    def bind_preview_row(self, view, item, divider, adapter, list_view):
+        refs = [entry for entry in self.preview_refs if entry.get() is not None]
+        if not any(entry.get() == view for entry in refs):
+            refs.append(jclass("java.lang.ref.WeakReference")(view))
+        self.preview_refs = refs
+        self.render_preview(view, self.config)
+
+    def update_previews(self):
+        for ref in self.preview_refs:
+            view = ref.get()
+            if view is not None:
+                self.render_preview(view, self.config)
+
+    def show_editor(self):
+        if not self.live:
+            return
+        from ui.alert import AlertDialogBuilder
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            return
+        dialog = AlertDialogBuilder(activity)
+        dialog.set_title("Уровень затемнения")
+        if not self.theme.isCurrentThemeDark():
+            dialog.set_message("Включи тёмную тему в настройках клиента.")
+            dialog.set_positive_button("Закрыть")
+            dialog.show()
+            return
+
+        Linear = jclass("android.widget.LinearLayout")
+        Params = jclass("android.widget.LinearLayout$LayoutParams")
+        slider = jclass("android.widget.SeekBar")(activity)
+        state = jclass("android.content.res.ColorStateList")
+        label = jclass("android.widget.TextView")(activity)
+        context = activity
+        config = self.read_config()
+        preview = self.preview_view(context)
+
+        content = Linear(context)
+        content.setOrientation(Linear.VERTICAL)
+        gutter = self.dp(context, 18)
+        content.setPadding(gutter, 0, gutter, self.dp(context, 10))
+        accent = self.theme.getColor(self.theme.key_windowBackgroundWhiteBlueText)
+        label.setTextSize(15)
+        label.setTextColor(accent)
+        label.setGravity(jclass("android.view.Gravity").END)
+        content.addView(label, Params(-1, -2))
+        slider.setMax(100)
+        slider.setContentDescription("Уровень затемнения")
+        slider.setProgressTintList(state.valueOf(accent))
+        slider.setThumbTintList(state.valueOf(accent))
+        slider.setProgress(config["intensity"])
+        content.addView(slider, Params(-1, self.dp(context, 48)))
+        content.addView(preview, Params(-1, -2))
+
+        def preview_value(value):
+            label.setText(f"{value}%")
+            self.render_preview(preview, {**config, "intensity": value})
+
+        class SliderListener(dynamic_proxy(jclass("android.widget.SeekBar$OnSeekBarChangeListener"))):
+            def onProgressChanged(self, bar, progress, from_user):
+                preview_value(int(progress))
+
+            def onStartTrackingTouch(self, bar):
+                pass
+
+            def onStopTrackingTouch(self, bar):
+                pass
+
+        slider.setOnSeekBarChangeListener(SliderListener())
+        preview_value(config["intensity"])
+
+        def save(builder, _):
+            value = int(slider.getProgress())
+            self.set_setting("intensity", value, reload_settings=True)
+            self.changed("intensity")(value)
+            builder.dismiss()
+
+        dialog.set_view(content)
+        dialog.set_negative_button("Отмена")
+        dialog.set_positive_button("Применить", save)
+        dialog.show()
