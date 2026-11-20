@@ -1,0 +1,233 @@
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment, get_messages_controller, get_user_config
+from hook_utils import find_class, get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.settings import Text
+
+__id__ = "default_chat_folder"
+__name__ = "Основная папка"
+__description__ = "Выбор стартовой папки из списка папок текущего аккаунта."
+__author__ = "Codex"
+__version__ = "1.2.0"
+__icon__ = "exteraPlugins/1"
+
+OFF = -1
+
+
+def setting_key(config):
+    return f"startup_folder_id_{int(config.getClientUserId())}"
+
+
+def folder_id(folder):
+    return 0 if folder.isDefault() else int(folder.id)
+
+
+def find_tab(tabs, filters, target_id):
+    default_tab = int(tabs.getDefaultTabId())
+    for position in range(tabs.getTabsCount()):
+        tab = tabs.getTab(position)
+        if tab is None:
+            continue
+        index = int(tab.id)
+        if index == default_tab:
+            fid = 0
+        elif 0 <= index < filters.size():
+            fid = folder_id(filters.get(index))
+        else:
+            continue
+        if fid == target_id:
+            return tab, position
+    return None
+
+
+class StartupHook(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.schedule(param.thisObject)
+        except Exception as error:
+            self.plugin.record_error(error)
+
+
+class DefaultFolderPlugin(BasePlugin):
+    status = "Ожидание запуска."
+    active = False
+
+    def record_error(self, error):
+        message = str(error).splitlines()[0][:180] if str(error) else type(error).__name__
+        self.status = f"Ошибка: {message}"
+        self.log(f"Основная папка: {message}")
+
+    def create_settings(self):
+        return [
+            Text(text="Выбрать стартовую папку",
+                 subtext="Папки текущего аккаунта",
+                 on_click=lambda *_: run_on_ui_thread(self.show_picker)),
+            Text(text="Последняя попытка запуска", subtext=self.status),
+        ]
+
+    def show_picker(self):
+        dialog = None
+        try:
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment is not None else None
+            if activity is None:
+                return
+            dialog = AlertDialogBuilder(activity)
+            dialog.set_title("Стартовая папка")
+            config = get_user_config()
+            if not int(config.getClientUserId()):
+                return
+            key = setting_key(config)
+            selected = int(self.get_setting(key, 0))
+            filters = get_messages_controller().getDialogFilters()
+            folders = [(OFF, "Обычный запуск")]
+            for index in range(filters.size()):
+                folder = filters.get(index)
+                fid = folder_id(folder)
+                name = "Все" if fid == 0 else str(folder.name)
+                folders.append((fid, name))
+            counts = {label: sum(label == name for _, name in folders) for _, label in folders}
+            labels = [("✓ " if fid == selected else "") + label +
+                      (f" (ID {fid})" if counts[label] > 1 else "") for fid, label in folders]
+
+            def choose(builder, index):
+                self.set_setting(key, folders[index][0])
+                builder.dismiss()
+
+            dialog.set_items(labels, choose)
+            dialog.set_negative_button("Отмена", lambda builder, _: builder.dismiss())
+            dialog.show()
+        except Exception as error:
+            self.record_error(error)
+            if dialog is not None:
+                dialog.set_message("Не удалось прочитать список папок.")
+                dialog.set_positive_button("Закрыть", lambda builder, _: builder.dismiss())
+                dialog.show()
+
+    def on_plugin_load(self):
+        self.active = True
+        self.done = set()
+        self.pending = set()
+        self.hooks = []
+        self.status = "Ожидаю список чатов."
+        try:
+            cls = find_class("org.telegram.ui.DialogsActivity")
+            if isinstance(cls, type):
+                cls = cls.getClass()
+            if cls is None:
+                raise RuntimeError("DialogsActivity не найден")
+            self.dialogs = cls
+            names = {"updateFilterTabs": 2, "onResume": 0, "onBecomeFullyVisible": 0}
+            for method in cls.getDeclaredMethods():
+                name = str(method.getName())
+                if name not in names or len(method.getParameterTypes()) != names[name]:
+                    continue
+                try:
+                    method.setAccessible(True)
+                    handle = self.hook_method(method, StartupHook(self))
+                    if handle is not None:
+                        self.hooks.append(handle)
+                except Exception as error:
+                    self.log(f"Основная папка: {name}: {error}")
+            if not self.hooks:
+                self.status = "Эта сборка не дала подключиться к списку чатов."
+            run_on_ui_thread(self.try_current)
+        except Exception as error:
+            self.record_error(error)
+
+    def on_plugin_unload(self):
+        self.active = False
+        for handle in self.hooks:
+            self.unhook_method(handle)
+        self.hooks.clear()
+
+    def try_current(self):
+        if not self.active:
+            return
+        try:
+            fragment = get_last_fragment()
+            if fragment is None:
+                return
+            if not self.dialogs.isInstance(fragment):
+                getter = getattr(fragment, "getDialogsActivity", None)
+                fragment = getter() if getter is not None else None
+            if fragment is not None:
+                self.schedule(fragment)
+        except Exception as error:
+            self.record_error(error)
+
+    def schedule(self, fragment):
+        if not self.active or not fragment.isMainDialogList() or fragment.isArchive():
+            return
+        if get_private_field(fragment, "onlySelect") or get_private_field(fragment, "inPreviewMode"):
+            return
+        config = fragment.getUserConfig()
+        uid = int(config.getClientUserId())
+        if not uid or uid in self.done or uid in self.pending:
+            return
+        key = setting_key(config)
+        target = int(self.get_setting(key, 0))
+        if target == OFF:
+            self.done.add(uid)
+            self.status = "Выбран обычный запуск."
+            return
+        tabs = get_private_field(fragment, "filterTabsView")
+        if tabs is None or tabs.getTabsCount() < 2:
+            return
+        original = int(tabs.getCurrentTabId())
+        pending = self.pending
+        pending.add(uid)
+
+        def apply(attempt=0):
+            if not self.active or self.pending is not pending:
+                return
+            retry = False
+            try:
+                if uid != int(get_user_config().getClientUserId()):
+                    return
+                if get_private_field(fragment, "filterTabsView") != tabs:
+                    return
+                if not tabs.isShown() or fragment.isPaused() or tabs.getWidth() <= 0:
+                    if attempt < 4:
+                        run_on_ui_thread(lambda: apply(attempt + 1), 100)
+                        retry = True
+                    return
+                current = int(tabs.getCurrentTabId())
+                if current != original and original >= 0:
+                    self.done.add(uid)
+                    self.status = "Вкладка уже переключена."
+                    return
+                action_bar = fragment.getActionBar()
+                if action_bar is not None and (action_bar.isSearchFieldVisible() or action_bar.isActionModeShowed()):
+                    self.done.add(uid)
+                    return
+                found = find_tab(tabs, fragment.getMessagesController().getDialogFilters(), target)
+                if found is None:
+                    self.status = "Выбранной вкладки пока нет в списке чатов."
+                    return
+                tab, position = found
+                tid = int(tab.id)
+                self.done.add(uid)
+                if tabs.isLocked(tid):
+                    self.status = "Выбранная папка недоступна."
+                    return
+                if current != tid:
+                    tabs.scrollToTab(tab, position)
+                self.status = "Стартовая папка выбрана."
+            except Exception as error:
+                self.done.add(uid)
+                self.record_error(error)
+            finally:
+                if not retry:
+                    pending.discard(uid)
+
+        try:
+            run_on_ui_thread(apply, 1)
+        except Exception:
+            pending.discard(uid)
+            raise
