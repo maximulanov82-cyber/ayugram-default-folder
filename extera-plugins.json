@@ -5,13 +5,13 @@
     {
       "id": "default_chat_folder",
       "name": "Основная папка",
-      "description": "Выбор стартовой папки из списка папок текущего аккаунта.",
+      "description": "Выбирает стартовую папку при инициализации списка чатов.",
       "author": "Codex",
-      "version": "1.2.0",
+      "version": "1.3.0",
       "icon": "exteraPlugins/1",
-      "file": "default_folder_1_2_0.plugin",
-      "sha256": "09bcc6a14a33731655cfa2aca377c0b1b57ab440959ff6909c0ed1c4969ea9b8",
-      "size": 9238
+      "file": "default_folder_1_3_0.plugin",
+      "sha256": "642dda214b5a992854f6531f013facd9feeef2073fe3750301c7e0e8ee038566",
+      "size": 8936
     }
   ]
 }
