@@ -12,6 +12,17 @@
       "file": "folderpin_1_6_0.plugin",
       "sha256": "53975383f20984166bb00e386b81491ec26f9cdbe48cb403ad84c9b61bd31596",
       "size": 30139
+    },
+    {
+      "id": "ultra_dark_mode",
+      "name": "Ultra Dark Mode",
+      "version": "1.0.0",
+      "author": "Codex",
+      "description": "Четыре палитры для тёмной темы и отдельное оформление сообщений.",
+      "app_version": ">=12.5.1",
+      "file": "ultra_dark_mode.plugin",
+      "sha256": "79056d6a2473927156b06c71fa032482c15b15b5f74d6c0806d624910662ced6",
+      "size": 27219
     }
   ]
 }
