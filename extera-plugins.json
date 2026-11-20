@@ -5,13 +5,13 @@
     {
       "id": "default_chat_folder",
       "name": "Основная папка",
-      "description": "Открывает выбранную папку при запуске exteraGram, сохраняя порядок вкладок.",
+      "description": "Выбор стартовой папки из списка папок текущего аккаунта.",
       "author": "Codex",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "icon": "exteraPlugins/1",
-      "file": "default_folder_1_1_0.plugin",
-      "sha256": "7944fa73aa3bfecd8b2b612d599a4b5fbf9c9d124c8d8a3f717e322fb54642ef",
-      "size": 7290
+      "file": "default_folder_1_2_0.plugin",
+      "sha256": "09bcc6a14a33731655cfa2aca377c0b1b57ab440959ff6909c0ed1c4969ea9b8",
+      "size": 9238
     }
   ]
 }
