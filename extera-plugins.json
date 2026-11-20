@@ -1,17 +1,17 @@
 {
   "schema": 1,
-  "name": "Основная папка",
+  "name": "FolderPin",
   "plugins": [
     {
       "id": "default_chat_folder",
-      "name": "Основная папка",
+      "name": "FolderPin",
       "description": "Выбирает стартовую папку при инициализации списка чатов.",
       "author": "Codex",
-      "version": "1.4.0",
-      "icon": "exteraPlugins/1",
-      "file": "default_folder_1_4_0.plugin",
-      "sha256": "5092dba5b1ebb1f02f4857f245659cfa78719d327a83697c0c907731a2889b19",
-      "size": 11871
+      "version": "1.4.1",
+      "icon": "windows10/3",
+      "file": "folderpin_1_4_1.plugin",
+      "sha256": "33feaf6874deb6444a82413ab44f9ee0b359df28e699d9b13ff7884b4271c1ae",
+      "size": 11762
     }
   ]
 }
