@@ -1,0 +1,270 @@
+from android_utils import run_on_ui_thread
+from base_plugin import AppEvent, BasePlugin, MethodHook
+from client_utils import get_last_fragment, get_messages_controller, get_user_config
+from hook_utils import find_class, get_private_field
+from java import jclass
+from ui.settings import Header, Text
+
+__id__ = "default_chat_folder"
+__name__ = "FolderPin"
+__description__ = "Выбирает стартовую папку при инициализации списка чатов."
+__author__ = "Codex"
+__version__ = "1.4.1"
+__icon__ = "windows10/3"
+
+
+def settings_key(user_id):
+    return f"startup_folder_id_{user_id}"
+
+
+def find_tab(tabs, filters, wanted):
+    for position in range(tabs.getTabsCount()):
+        tab = tabs.getTab(position)
+        if tab is None:
+            continue
+        index = int(tab.id)
+        if 0 <= index < filters.size() and int(filters.get(index).id) == wanted:
+            return tab
+    return None
+
+
+class ApplyAtStartup(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        self.plugin.try_apply(param.thisObject)
+
+
+class DefaultFolderPlugin(BasePlugin):
+    active = False
+    status = "Плагин выключен."
+
+    def create_settings(self):
+        try:
+            user_id = int(get_user_config().getClientUserId())
+            filters = get_messages_controller().getDialogFilters()
+            key = settings_key(user_id)
+            selected = int(self.get_setting(key, 0))
+            folders = [(-1, "Как настроено в клиенте")]
+            for index in range(filters.size()):
+                folder = filters.get(index)
+                fid = int(folder.id)
+                folders.append((fid, "Все" if fid == 0 else str(folder.name)))
+
+            def row(fid, label):
+                def select(*_):
+                    if int(get_user_config().getClientUserId()) == user_id:
+                        self.set_setting(key, fid, reload_settings=True)
+                return Text(text=label, icon="msg_check" if fid == selected else "msg_folder",
+                            accent=fid == selected, on_click=select)
+
+            return [Header(text="Папка при запуске"),
+                    *[row(fid, label) for fid, label in folders]]
+        except Exception as error:
+            self.report("Список папок", error)
+            return [Text(text="Список папок недоступен", subtext=self.status)]
+
+    def report(self, step, error):
+        details = str(error).splitlines()[0][:180] if str(error) else type(error).__name__
+        self.status = f"{step}: {details}"
+        self.log(f"Основная папка: {self.status}")
+
+    def on_plugin_load(self):
+        self.active = True
+        self.finished = set()
+        self.hooks = []
+        self.dialogs = None
+        self.probing = False
+        self.backgrounded = False
+        self.probe_token = object()
+        self.probe_screen = "экран ещё не открыт"
+        self.status = "Ожидание главного списка чатов."
+        try:
+            cls = find_class("org.telegram.ui.DialogsActivity")
+            if isinstance(cls, type):
+                cls = cls.getClass()
+            if cls is None:
+                raise RuntimeError("DialogsActivity не найден")
+            self.dialogs = cls
+            targets = {"updateFilterTabs": 2, "onBecomeFullyVisible": 0, "onResume": 0}
+            for method in cls.getDeclaredMethods():
+                name = str(method.getName())
+                if name in targets and len(method.getParameterTypes()) == targets[name]:
+                    try:
+                        method.setAccessible(True)
+                        handle = self.hook_method(method, ApplyAtStartup(self))
+                        if handle is not None:
+                            self.hooks.append(handle)
+                    except Exception as error:
+                        self.report(name, error)
+            if not self.hooks:
+                self.status = "Хуки запуска недоступны в этой сборке."
+        except Exception as error:
+            self.report("Подключение к списку чатов", error)
+        run_on_ui_thread(self.start_probe)
+
+    def on_plugin_unload(self):
+        self.active = False
+        for handle in self.hooks:
+            self.unhook_method(handle)
+        self.hooks.clear()
+
+    def on_app_event(self, event):
+        if event == AppEvent.PAUSE:
+            run_on_ui_thread(self.left_foreground)
+        elif event in (AppEvent.START, AppEvent.RESUME):
+            run_on_ui_thread(self.entered_foreground)
+
+    def left_foreground(self):
+        if not self.active:
+            return
+        self.backgrounded = True
+        self.probing = False
+        self.probe_token = object()
+
+    def entered_foreground(self):
+        if not self.active:
+            return
+        if self.backgrounded:
+            self.backgrounded = False
+            self.finished.clear()
+        self.start_probe()
+
+    def find_open_chats(self):
+        # SDK versions return either the visible child or the MainTabs container.
+        top = get_last_fragment()
+        if top is None:
+            launch = jclass("org.telegram.ui.LaunchActivity")
+            top = launch.getLastFragment()
+        if top is None:
+            return None
+
+        name = str(top.getClass().getName())
+        self.probe_screen = name.rsplit(".", 1)[-1]
+        for getter in ("getCurrentVisibleFragment", "getDialogsActivity"):
+            method = getattr(top, getter, None)
+            if method is not None:
+                child = method()
+                if self.is_chat_screen(child):
+                    return child
+        return top if self.is_chat_screen(top) else None
+
+    def is_chat_screen(self, fragment):
+        if fragment is None:
+            return False
+        if self.dialogs is not None and self.dialogs.isInstance(fragment):
+            return True
+        return str(fragment.getClass().getName()) == "org.telegram.ui.DialogsActivity"
+
+    def start_probe(self):
+        if not self.active or self.backgrounded or self.probing:
+            return
+        self.probing = True
+        self.probe(0, self.probe_token)
+
+    def probe(self, attempt, token):
+        if not self.active or token is not self.probe_token:
+            return
+        try:
+            uid = int(get_user_config().getClientUserId())
+            if not uid or uid in self.finished:
+                self.probing = False
+                return
+            fragment = self.find_open_chats()
+            if fragment is not None:
+                self.try_apply(fragment)
+            if uid in self.finished:
+                self.probing = False
+                return
+            delays = (150, 300, 600, 1000, 1500, 2400)
+            if attempt < len(delays):
+                run_on_ui_thread(lambda: self.probe(attempt + 1, token), delays[attempt])
+                return
+            if fragment is None:
+                self.status = f"Экран чатов не найден. Открыт: {self.probe_screen}."
+            self.probing = False
+        except Exception as error:
+            self.probing = False
+            self.report("Поиск экрана чатов", error)
+
+    def try_apply(self, fragment):
+        if not self.active or self.backgrounded:
+            return
+        try:
+            if fragment.isArchive() or not fragment.isMainDialogList():
+                self.status = "Открытый список чатов не является главным."
+                return
+            if get_private_field(fragment, "onlySelect") or get_private_field(fragment, "inPreviewMode"):
+                return
+            uid = int(fragment.getUserConfig().getClientUserId())
+            if not uid or uid != int(get_user_config().getClientUserId()) or uid in self.finished:
+                return
+            tabs = get_private_field(fragment, "filterTabsView")
+            if tabs is None or tabs.getTabsCount() < 2 or tabs.getVisibility() != 0:
+                self.status = "Вкладки ещё не готовы."
+                return
+            selected = int(self.get_setting(settings_key(uid), 0))
+            if selected < 0:
+                self.finished.add(uid)
+                self.status = "Оставлена настройка клиента."
+                return
+            target = find_tab(tabs, fragment.getMessagesController().getDialogFilters(), selected)
+            if target is None:
+                self.status = "Выбранная папка скрыта или отсутствует."
+                return
+            destination = int(target.id)
+            if tabs.isLocked(destination):
+                self.finished.add(uid)
+                self.status = "Выбранная папка заблокирована."
+                return
+            action_bar = fragment.getActionBar()
+            if action_bar is not None and (action_bar.isSearchFieldVisible() or action_bar.isActionModeShowed()):
+                self.finished.add(uid)
+                self.status = "В момент запуска был открыт поиск или режим выделения."
+                return
+
+            if get_private_field(fragment, "startedTracking") or get_private_field(fragment, "tabsAnimationInProgress"):
+                self.finished.add(uid)
+                self.status = "Вкладка переключается пользователем."
+                return
+            self.finished.add(uid)
+            pages = get_private_field(fragment, "viewPages")
+            if pages is None or not len(pages):
+                raise RuntimeError("Нет активной страницы чатов")
+            page = pages[0]
+            old_index = int(get_private_field(page, "selectedType"))
+            old_tab = int(tabs.getCurrentTabId())
+            if old_index != destination or old_tab != destination:
+                self.select(fragment, tabs, page, destination, old_index, old_tab)
+            self.status = "Выбранная папка открыта."
+        except Exception as error:
+            self.report("Выбор стартовой папки", error)
+
+    def select(self, fragment, tabs, page, destination, old_index, old_tab):
+        # Bind the list to the target page and synchronize the native tab indicator.
+        # The startup path must work without waiting for swipe animation or view width.
+        old_stable = int(tabs.getStableId(old_tab))
+        stable = int(tabs.getStableId(destination))
+        if stable < 0:
+            raise RuntimeError("Вкладка без устойчивого ID")
+        rebuild = fragment.switchToCurrentSelectedMode
+        refresh = tabs.finishAddingTabs
+        selected_type = page.getClass().getDeclaredField("selectedType")
+        selected_type.setAccessible(True)
+        selected_type.setInt(page, destination)
+        try:
+            if not tabs.selectTabWithStableId(stable):
+                raise RuntimeError("Клиент не принял выбранную вкладку")
+            rebuild(False)
+            refresh(False)
+            if int(tabs.getCurrentTabId()) != destination or int(get_private_field(page, "selectedType")) != destination:
+                raise RuntimeError("Клиент изменил выбранную вкладку")
+        except Exception:
+            selected_type.setInt(page, old_index)
+            if old_stable >= 0:
+                tabs.selectTabWithStableId(old_stable)
+            rebuild(False)
+            refresh(False)
+            raise
