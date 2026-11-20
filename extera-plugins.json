@@ -7,11 +7,11 @@
       "name": "FolderPin",
       "description": "Выбирает стартовую папку при инициализации списка чатов.",
       "author": "Codex",
-      "version": "1.4.1",
+      "version": "1.5.0",
       "icon": "windows10/3",
-      "file": "folderpin_1_4_1.plugin",
-      "sha256": "33feaf6874deb6444a82413ab44f9ee0b359df28e699d9b13ff7884b4271c1ae",
-      "size": 11762
+      "file": "folderpin_1_5_0.plugin",
+      "sha256": "354f1e3854b0f3a4324d91d08152c5c8c394ce1e117a42835b61520729ba8041",
+      "size": 23988
     }
   ]
 }
