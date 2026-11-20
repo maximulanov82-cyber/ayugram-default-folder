@@ -1,0 +1,183 @@
+from android_utils import R
+from base_plugin import BasePlugin, MethodHook
+from client_utils import get_last_fragment
+from hook_utils import find_class, get_private_field
+from java.lang import Boolean
+from ui.settings import Input, Text
+
+__id__ = "default_chat_folder"
+__name__ = "Основная папка"
+__description__ = "Открывает выбранную папку при запуске exteraGram, сохраняя порядок вкладок."
+__author__ = "Codex"
+__version__ = "1.1.0"
+__icon__ = "exteraPlugins/1"
+
+SETTING = "startup_folder"
+ALL_NAMES = {"все", "все чаты", "all", "all chats"}
+
+
+def normalize(value):
+    return " ".join(str(value).casefold().split())
+
+
+def resolve_tab(tabs, filters, preference):
+    query = normalize(preference)
+    number = query[3:].strip() if query.startswith("id:") else query
+    by_id = int(number) if number.isascii() and number.isdecimal() and len(number) <= 10 else None
+    if query.startswith("id:") and by_id is None:
+        return None
+    explicit_name = query.startswith("имя:")
+    if explicit_name:
+        query = query[4:].strip()
+    use_all = not explicit_name and (query in ALL_NAMES or by_id == 0)
+    matches = []
+    for position in range(tabs.getTabsCount()):
+        tab = tabs.getTab(position)
+        if tab is None:
+            continue
+        index = int(tab.id)
+        if index == int(tabs.getDefaultTabId()):
+            if use_all:
+                return tab, position
+            continue
+        if use_all or not 0 <= index < filters.size():
+            continue
+        folder = filters.get(index)
+        if by_id is not None:
+            if int(folder.id) == by_id:
+                return tab, position
+        elif query and query == normalize(folder.name):
+            matches.append((tab, position))
+    return matches[0] if len(matches) == 1 else None
+
+
+class TabsReady(MethodHook):
+    def __init__(self, plugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param):
+        try:
+            self.plugin.schedule(param.thisObject)
+        except Exception as error:
+            self.plugin.report(error)
+
+
+class DefaultFolderPlugin(BasePlugin):
+    def create_settings(self):
+        rows = [
+            Input(key=SETTING, text="Папка при запуске", default="Все",
+                  subtext="Все, точное имя папки или id:123. Пустое поле — обычный запуск.",
+                  icon="msg_folder"),
+        ]
+        if self.status:
+            rows.append(Text(text="Состояние", subtext=self.status))
+        return rows
+
+    def report(self, error):
+        if not self.status:
+            self.status = "Не удалось применить выбор папки."
+            self.log(f"Основная папка: {error}")
+
+    status = ""
+    active = False
+
+    def on_plugin_load(self):
+        self.active = True
+        self.status = ""
+        self.finished = set()
+        self.pending = set()
+        self.hooks = []
+        try:
+            dialogs = find_class("org.telegram.ui.DialogsActivity")
+            if dialogs is None:
+                raise RuntimeError("DialogsActivity отсутствует")
+            # Chaquopy exposes either a Python class proxy or an already reflected Java Class.
+            if isinstance(dialogs, type):
+                dialogs = dialogs.getClass()
+            for name, types in (("updateFilterTabs", (Boolean.TYPE, Boolean.TYPE)),
+                                ("onResume", ())):
+                try:
+                    method = dialogs.getDeclaredMethod(name, *types)
+                    method.setAccessible(True)
+                    handle = self.hook_method(method, TabsReady(self))
+                    if handle is not None:
+                        self.hooks.append(handle)
+                except Exception as error:
+                    self.log(f"Основная папка: {name}: {error}")
+            if not self.hooks:
+                self.status = "Эта сборка клиента не поддерживается."
+        except Exception as error:
+            self.report(error)
+
+    def on_plugin_unload(self):
+        self.active = False
+        for handle in self.hooks:
+            self.unhook_method(handle)
+        self.hooks.clear()
+
+    def schedule(self, fragment):
+        if not self.active or not fragment.isMainDialogList() or fragment.isArchive():
+            return
+        if get_private_field(fragment, "onlySelect") or get_private_field(fragment, "inPreviewMode"):
+            return
+        uid = int(fragment.getUserConfig().getClientUserId())
+        if not uid or uid in self.finished or uid in self.pending:
+            return
+        preference = str(self.get_setting(SETTING, "Все") or "").strip()
+        if not preference:
+            return
+        tabs = get_private_field(fragment, "filterTabsView")
+        if tabs is None or tabs.getVisibility() != 0 or tabs.getTabsCount() < 2:
+            return
+        original = int(tabs.getCurrentTabId())
+        pending = self.pending
+        pending.add(uid)
+
+        def apply(retry=True):
+            retry_posted = False
+            try:
+                if not self.active or self.pending is not pending or uid in self.finished:
+                    return
+                if not tabs.isAttachedToWindow() or get_last_fragment() != fragment:
+                    return
+                if get_private_field(fragment, "filterTabsView") != tabs:
+                    return
+                if uid != int(fragment.getUserConfig().getClientUserId()):
+                    return
+                if int(tabs.getCurrentTabId()) != original:
+                    self.finished.add(uid)
+                    return
+                if tabs.getWidth() <= 0 and retry:
+                    retry_posted = tabs.postDelayed(R(lambda: apply(False)), 48)
+                    if retry_posted:
+                        return
+                if tabs.getWidth() <= 0 or tabs.getVisibility() != 0 or not tabs.isEnabled():
+                    return
+                action_bar = fragment.getActionBar()
+                if action_bar is not None and (action_bar.isSearchFieldVisible() or action_bar.isActionModeShowed()):
+                    self.finished.add(uid)
+                    return
+                filters = fragment.getMessagesController().getDialogFilters()
+                found = resolve_tab(tabs, filters, preference)
+                if found is not None:
+                    tab, position = found
+                    tab_id = int(tab.id)
+                    self.finished.add(uid)
+                    if tab_id != original and not tabs.isLocked(tab_id):
+                        tabs.scrollToTab(tab, position)
+                elif fragment.getMessagesController().dialogFiltersLoaded:
+                    self.finished.add(uid)
+            except Exception as error:
+                self.finished.add(uid)
+                self.report(error)
+            finally:
+                if not retry_posted:
+                    pending.discard(uid)
+
+        try:
+            if not tabs.post(R(apply)):
+                pending.discard(uid)
+        except Exception:
+            pending.discard(uid)
+            raise
